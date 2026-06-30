@@ -1,0 +1,172 @@
+name: Veracode Baseline Delta
+
+# Runs a Pipeline Scan delta for a target repo against the baselines stored in
+# this (the veracode) repo. Behaviour is driven entirely by veracode.yml:
+#   veracode_static_scan.baseline.mode             -> full | mitigated
+#   veracode_static_scan.baseline.fail_on_severity -> what breaks the build
+#   veracode_static_scan.baseline.strict           -> fail if a baseline is missing
+#
+# Call this from the master static-scan orchestration on push / pull_request of a
+# target repo, in place of (or alongside) a plain Pipeline Scan.
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        required: true
+        type: string
+      target_ref:
+        required: true
+        type: string
+    secrets:
+      VERACODE_API_ID:
+        required: true
+      VERACODE_API_KEY:
+        required: true
+      TARGET_CHECKOUT_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AUTOPACK_OUT_DIR: verascan
+  STORE_DIR: store/baselines
+  MGR: store/helper/baseline/baseline_manager.py
+
+jobs:
+  delta:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve identifiers
+        shell: bash
+        run: |
+          set -e
+          ORG="${{ inputs.target_repo }}"; echo "ORG=${ORG%%/*}"   >> "$GITHUB_ENV"
+          REPO="${{ inputs.target_repo }}"; echo "REPO=${REPO##*/}" >> "$GITHUB_ENV"
+          echo "BRANCH=${{ inputs.target_ref }}" >> "$GITHUB_ENV"
+
+      # Pull the target source to package + scan.
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_ref }}
+          token: ${{ secrets.TARGET_CHECKOUT_TOKEN }}
+
+      # Sparse-checkout only this repo's slice of the store + the helpers.
+      - name: Checkout baseline store (sparse)
+        uses: actions/checkout@v4
+        with:
+          path: store
+          sparse-checkout: |
+            helper/baseline
+            veracode.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Read baseline config from veracode.yml
+        shell: bash
+        run: |
+          set -e
+          pip3 install -q -r store/helper/baseline/requirements.txt
+          python3 store/helper/baseline/config.py --file store/veracode.yml >> "$GITHUB_ENV"
+
+      - name: Fetch this repo's baselines
+        shell: bash
+        run: |
+          set -e
+          git -C store sparse-checkout add "baselines/${ORG}/${REPO}" || true
+          ls -R "store/baselines/${ORG}/${REPO}" 2>/dev/null || echo "no stored baselines yet"
+
+      - name: Gate on enabled flag
+        shell: bash
+        run: |
+          if [ "${BASELINE_ENABLED}" != "true" ]; then
+            echo "Baseline delta disabled in veracode.yml; nothing to do."
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Veracode CLI
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          set -e
+          curl -fsS -O https://tools.veracode.com/veracode-cli/install
+          chmod +x ./install; ./install | tee install.log
+          CLI_DIR="$(awk -F'"' '/copying files into/ {print $2; exit}' install.log)"
+          [ -n "$CLI_DIR" ] || { echo "CLI_DIR not found"; exit 1; }
+          echo "$CLI_DIR" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/.veracode"; : > "$HOME/.veracode/veracode.yml"
+
+      - name: Autopackage + discover
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$AUTOPACK_OUT_DIR"
+          veracode package --source . --output "$AUTOPACK_OUT_DIR" --trust
+          exts="jar war ear dll exe nupkg zip tar tgz tar.gz"
+          : > artifacts_list.txt
+          for ext in $exts; do
+            for f in "$AUTOPACK_OUT_DIR"/*."$ext"; do [ -f "$f" ] && echo "$f" >> artifacts_list.txt; done
+          done
+          [ -s artifacts_list.txt ] || { echo "No artifacts found"; exit 1; }
+          nl artifacts_list.txt
+
+      - name: Download Pipeline Scanner
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          set -e
+          wget -q https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -n pipeline-scan-LATEST.zip
+
+      - name: Run delta scans
+        if: env.SKIP != 'true'
+        shell: bash
+        run: |
+          rc_overall=0; scanned=0; passed=0; failed=0; missing=0
+          mkdir -p work
+          while IFS= read -r artifact; do
+            [ -z "$artifact" ] && continue
+            name="$(basename "$artifact")"
+            dest="work/${name}.baseline.json"
+
+            set +e
+            python3 "$MGR" pull --store "$STORE_DIR" \
+              --org "$ORG" --repo "$REPO" --branch "$BRANCH" --artifact "$name" \
+              --mode "${BASELINE_MODE}" --dest "$dest" \
+              $([ "${BASELINE_STRICT}" = "true" ] && echo --strict)
+            pull_rc=$?
+            set -e
+
+            if [ $pull_rc -eq 1 ]; then               # strict + missing
+              echo "::error::strict baseline missing for $name"; failed=$((failed+1)); rc_overall=1; continue
+            fi
+
+            baseline_arg=()
+            if [ $pull_rc -eq 0 ]; then baseline_arg=( --baseline_file "$dest" ); else missing=$((missing+1)); fi
+
+            echo "::group::delta $name"
+            set +e
+            java -jar pipeline-scan.jar \
+              --veracode_api_id  "${{ secrets.VERACODE_API_ID }}" \
+              --veracode_api_key "${{ secrets.VERACODE_API_KEY }}" \
+              --file "$artifact" "${baseline_arg[@]}" \
+              --fail_on_severity "${BASELINE_FAIL_SEVERITY}"
+            rc=$?
+            set -e
+            echo "::endgroup::"
+
+            scanned=$((scanned+1))
+            if [ $rc -ne 0 ]; then echo "::error::delta FAILED $name"; failed=$((failed+1)); rc_overall=1
+            else echo "::notice::delta PASSED $name"; passed=$((passed+1)); fi
+          done < artifacts_list.txt
+
+          {
+            echo "## Veracode Baseline Delta (${BASELINE_MODE})"
+            echo "| metric | count |"; echo "|---|---:|"
+            echo "| scanned | $scanned |"; echo "| passed | $passed |"
+            echo "| failed | $failed |"; echo "| no baseline | $missing |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc_overall

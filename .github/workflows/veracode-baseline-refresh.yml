@@ -1,0 +1,196 @@
+name: Veracode Baseline Refresh
+
+# Creates / updates the Pipeline Scan baselines that delta scans compare against.
+# Baselines are stored INSIDE this (the veracode) repo, so the commit back to the
+# store uses the repo's own GITHUB_TOKEN. No separate baseline repo and no
+# long-lived PAT are required.
+#
+# Wiring: call this from the integration's master orchestration (scheduled and/or
+# on default-branch push of a target repo), or run it ad hoc via workflow_dispatch.
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        description: "org/repo to baseline (the scanned repo)"
+        required: true
+        type: string
+      target_ref:
+        description: "branch/ref of the target repo to baseline"
+        required: true
+        type: string
+    secrets:
+      VERACODE_API_ID:
+        required: true
+      VERACODE_API_KEY:
+        required: true
+      TARGET_CHECKOUT_TOKEN:
+        description: "token with read access to the target repo (App installation token or PAT)"
+        required: true
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "org/repo to baseline"
+        required: true
+      target_ref:
+        description: "branch/ref to baseline"
+        required: true
+        default: main
+
+permissions:
+  contents: write   # commit baselines back into this (the store) repo
+
+# Serialize refreshes of the same target repo+branch so they never race each other.
+concurrency:
+  group: veracode-baseline-${{ inputs.target_repo }}-${{ inputs.target_ref }}
+  cancel-in-progress: false
+
+env:
+  AUTOPACK_OUT_DIR: verascan
+  STORE_DIR: baselines
+  MGR: helper/baseline/baseline_manager.py
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. The store == this repo. Check it out; this is where we commit.
+      - name: Checkout veracode (baseline store)
+        uses: actions/checkout@v4
+
+      - name: Read baseline config from veracode.yml
+        shell: bash
+        run: |
+          set -e
+          pip3 install -q -r helper/baseline/requirements.txt
+          python3 helper/baseline/config.py --file veracode.yml >> "$GITHUB_ENV"
+
+      - name: Resolve identifiers
+        shell: bash
+        run: |
+          set -e
+          ORG="${{ inputs.target_repo }}"; ORG="${ORG%%/*}"
+          REPO="${{ inputs.target_repo }}"; REPO="${REPO##*/}"
+          echo "ORG=$ORG"   >> "$GITHUB_ENV"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          echo "BRANCH=${{ inputs.target_ref }}" >> "$GITHUB_ENV"
+
+      # 2. Bring in the target repo's source to package + scan.
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ inputs.target_ref }}
+          token: ${{ secrets.TARGET_CHECKOUT_TOKEN }}
+          path: _target
+
+      - name: Install Veracode CLI
+        shell: bash
+        run: |
+          set -e
+          curl -fsS -O https://tools.veracode.com/veracode-cli/install
+          chmod +x ./install
+          ./install | tee install.log
+          CLI_DIR="$(awk -F'"' '/copying files into/ {print $2; exit}' install.log)"
+          [ -n "$CLI_DIR" ] || { echo "CLI_DIR not found"; exit 1; }
+          echo "$CLI_DIR" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/.veracode"; : > "$HOME/.veracode/veracode.yml"
+
+      - name: Autopackage target
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$AUTOPACK_OUT_DIR"
+          veracode package --source _target --output "$AUTOPACK_OUT_DIR" --trust
+          ls -lh "$AUTOPACK_OUT_DIR" || true
+
+      - name: Discover artifacts
+        shell: bash
+        run: |
+          set -e
+          exts="jar war ear dll exe nupkg zip tar tgz tar.gz"
+          : > artifacts_list.txt
+          for ext in $exts; do
+            for f in "$AUTOPACK_OUT_DIR"/*."$ext"; do
+              [ -f "$f" ] && echo "$f" >> artifacts_list.txt
+            done
+          done
+          [ -s artifacts_list.txt ] || { echo "No artifacts found"; exit 1; }
+          nl artifacts_list.txt
+
+      - name: Download Pipeline Scanner + mitigation overlay
+        shell: bash
+        run: |
+          set -e
+          wget -q https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -n pipeline-scan-LATEST.zip
+          pip3 install -q -r https://raw.githubusercontent.com/tjarrettveracode/veracode-pipeline-mitigation/master/requirements.txt
+          wget -q https://raw.githubusercontent.com/tjarrettveracode/veracode-pipeline-mitigation/master/vcpipemit.py -O vcpipemit.py
+
+      - name: Create + record baselines
+        shell: bash
+        env:
+          VERACODE_API_KEY_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY_SECRET: ${{ secrets.VERACODE_API_KEY }}
+        run: |
+          set -e
+          keep_args=()
+          while IFS= read -r artifact; do
+            [ -z "$artifact" ] && continue
+            name="$(basename "$artifact")"
+            keep_args+=( "$name" )
+            echo "::group::baseline $name"
+
+            rm -f results.json mitigated.json
+            set +e
+            java -jar pipeline-scan.jar \
+              --veracode_api_id  "${{ secrets.VERACODE_API_ID }}" \
+              --veracode_api_key "${{ secrets.VERACODE_API_KEY }}" \
+              --file "$artifact" --issue_details true --json_output true --fail_on_severity ""
+            set -e
+            if [ ! -f results.json ]; then
+              echo "::warning::no results.json for $name; skipping"; echo "::endgroup::"; continue
+            fi
+
+            # mitigation overlay only when mode is mitigated
+            mit_arg=()
+            if [ "${BASELINE_MODE}" = "mitigated" ]; then
+              python3 "$MGR" mitigate \
+                --script vcpipemit.py --results results.json \
+                --applicationname "$REPO" --output mitigated.json || true
+              [ -f mitigated.json ] && mit_arg=( --mitigated mitigated.json )
+            fi
+
+            python3 "$MGR" record --store "$STORE_DIR" \
+              --org "$ORG" --repo "$REPO" --branch "$BRANCH" --artifact "$name" \
+              --results results.json "${mit_arg[@]}"
+            echo "::endgroup::"
+          done < artifacts_list.txt
+
+          if [ "${BASELINE_PRUNE_ORPHANS}" = "true" ]; then
+            python3 "$MGR" prune --store "$STORE_DIR" \
+              --org "$ORG" --repo "$REPO" --branch "$BRANCH" --keep "${keep_args[@]}"
+          fi
+
+          python3 "$MGR" status --store "$STORE_DIR" \
+            --org "$ORG" --repo "$REPO" --branch "$BRANCH" >> "$GITHUB_STEP_SUMMARY" || true
+
+      # 3. Commit to the store with rebase-retry (NOT --force) so concurrent
+      #    refreshes of *other* repos can never clobber each other.
+      - name: Commit baselines to store
+        shell: bash
+        run: |
+          set -e
+          git config user.email "veracode-bot@users.noreply.github.com"
+          git config user.name  "veracode-bot"
+          git add "$STORE_DIR/$ORG/$REPO"
+          if git diff --cached --quiet; then echo "No baseline changes"; exit 0; fi
+          git commit -m "baseline: ${ORG}/${REPO}@${BRANCH} [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin "${BASELINE_STORE_BRANCH:-main}" || true
+            if git push origin "HEAD:${BASELINE_STORE_BRANCH:-main}"; then
+              echo "pushed on attempt $i"; exit 0
+            fi
+            echo "push attempt $i failed; retrying"; sleep $((RANDOM % 5 + 2))
+          done
+          echo "::error::could not push baselines after retries"; exit 1

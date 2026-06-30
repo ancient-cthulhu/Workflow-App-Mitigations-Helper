@@ -1,0 +1,35 @@
+name: Veracode Delta Scan (new findings)
+
+# Option 2 of 3: a delta scan that gates on findings introduced since the stored
+# tech-debt baseline. Existing findings are suppressed; the build fails only on
+# net-new findings at or above fail_on_severity. Platform mitigations are not
+# consulted. Selectable explicitly here, or via veracode.yml baseline.mode: full.
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        required: true
+        type: string
+      target_ref:
+        required: true
+        type: string
+    secrets:
+      VERACODE_API_ID:
+        required: true
+      VERACODE_API_KEY:
+        required: true
+      TARGET_CHECKOUT_TOKEN:
+        required: true
+
+jobs:
+  scan:
+    uses: ./.github/workflows/veracode-baseline-delta.yml
+    with:
+      target_repo: ${{ inputs.target_repo }}
+      target_ref: ${{ inputs.target_ref }}
+      mode: full
+    secrets:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+      TARGET_CHECKOUT_TOKEN: ${{ secrets.TARGET_CHECKOUT_TOKEN }}

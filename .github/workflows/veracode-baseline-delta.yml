@@ -9,6 +9,15 @@ name: Veracode Baseline Delta
 # Call this from the master static-scan orchestration on push / pull_request of a
 # target repo, in place of (or alongside) a plain Pipeline Scan.
 
+# Shared scan engine for all three scan options. Behaviour is driven by
+# veracode.yml (veracode_static_scan.baseline), or overridden by the `mode`
+# input when a caller selects a specific option:
+#   none      -> plain Pipeline Scan (fail on findings at/above fail_on_severity)
+#   full      -> new-findings delta against the stored tech-debt baseline
+#   mitigated -> new-findings delta that also excludes APPROVED platform mitigations
+# When `mode` is supplied the scan always runs; when it is empty the enabled flag
+# in veracode.yml decides.
+
 on:
   workflow_call:
     inputs:
@@ -18,6 +27,11 @@ on:
       target_ref:
         required: true
         type: string
+      mode:
+        description: "none | full | mitigated. Empty reads mode + enabled from veracode.yml."
+        required: false
+        type: string
+        default: ""
     secrets:
       VERACODE_API_ID:
         required: true
@@ -78,6 +92,14 @@ jobs:
           git -C store sparse-checkout add "baselines/${ORG}/${REPO}" || true
           ls -R "store/baselines/${ORG}/${REPO}" 2>/dev/null || echo "no stored baselines yet"
 
+      - name: Apply mode override
+        if: inputs.mode != ''
+        shell: bash
+        run: |
+          echo "BASELINE_MODE=${{ inputs.mode }}" >> "$GITHUB_ENV"
+          echo "BASELINE_ENABLED=true" >> "$GITHUB_ENV"
+          echo "Mode forced to '${{ inputs.mode }}' by caller (enabled gate bypassed)."
+
       - name: Gate on enabled flag
         shell: bash
         run: |
@@ -121,40 +143,78 @@ jobs:
           wget -q https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -n pipeline-scan-LATEST.zip
 
+      - name: Download mitigation overlay
+        if: env.SKIP != 'true' && env.BASELINE_MODE == 'mitigated'
+        shell: bash
+        run: |
+          set -e
+          pip3 install -q -r https://raw.githubusercontent.com/veracode/veracode-pipeline-mitigation/master/requirements.txt
+          wget -q https://raw.githubusercontent.com/veracode/veracode-pipeline-mitigation/master/vcpipemit.py -O vcpipemit.py
+
       - name: Run delta scans
         if: env.SKIP != 'true'
         shell: bash
+        env:
+          # vcpipemit and the app-profile lookup read these.
+          VERACODE_API_KEY_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY_SECRET: ${{ secrets.VERACODE_API_KEY }}
         run: |
           rc_overall=0; scanned=0; passed=0; failed=0; missing=0
           mkdir -p work
-          while IFS= read -r artifact; do
-            [ -z "$artifact" ] && continue
-            name="$(basename "$artifact")"
-            dest="work/${name}.baseline.json"
+          # Resolve the deterministic app profile name once (org/repo by default).
+          app="${BASELINE_APP_PROFILE}"; app="${app//\{org\}/$ORG}"; app="${app//\{repo\}/$REPO}"
 
-            set +e
-            python3 "$MGR" pull --store "$STORE_DIR" \
-              --org "$ORG" --repo "$REPO" --branch "$BRANCH" --artifact "$name" \
-              --mode "${BASELINE_MODE}" --dest "$dest" \
-              $([ "${BASELINE_STRICT}" = "true" ] && echo --strict)
-            pull_rc=$?
-            set -e
-
-            if [ $pull_rc -eq 1 ]; then               # strict + missing
-              echo "::error::strict baseline missing for $name"; failed=$((failed+1)); rc_overall=1; continue
-            fi
-
-            baseline_arg=()
-            if [ $pull_rc -eq 0 ]; then baseline_arg=( --baseline_file "$dest" ); else missing=$((missing+1)); fi
-
-            echo "::group::delta $name"
-            set +e
+          scan() {  # scan <artifact> <fail_severity> [extra pipeline args...]
+            local art="$1"; local sev="$2"; shift 2
             java -jar pipeline-scan.jar \
               --veracode_api_id  "${{ secrets.VERACODE_API_ID }}" \
               --veracode_api_key "${{ secrets.VERACODE_API_KEY }}" \
-              --file "$artifact" "${baseline_arg[@]}" \
-              --fail_on_severity "${BASELINE_FAIL_SEVERITY}"
-            rc=$?
+              --file "$art" --fail_on_severity "$sev" "$@"
+          }
+
+          while IFS= read -r artifact; do
+            [ -z "$artifact" ] && continue
+            name="$(basename "$artifact")"
+            tech="work/${name}.baseline.json"
+
+            # Pull the tech-debt baseline unless mode is none.
+            have_tech=""
+            if [ "${BASELINE_MODE}" != "none" ]; then
+              set +e
+              python3 "$MGR" pull --store "$STORE_DIR" \
+                --org "$ORG" --repo "$REPO" --branch "$BRANCH" --artifact "$name" \
+                --mode full --dest "$tech" \
+                $([ "${BASELINE_STRICT}" = "true" ] && echo --strict)
+              pull_rc=$?
+              set -e
+              if [ $pull_rc -eq 1 ]; then
+                echo "::error::strict baseline missing for $name"; failed=$((failed+1)); rc_overall=1; continue
+              fi
+              [ $pull_rc -eq 0 ] && have_tech="$tech" || missing=$((missing+1))
+            fi
+
+            echo "::group::delta $name (${BASELINE_MODE})"
+            set +e
+            if [ "${BASELINE_MODE}" = "mitigated" ]; then
+              # Pass 1: findings net-new vs the tech-debt baseline (or all, if none).
+              p1=(); [ -n "$have_tech" ] && p1=(--baseline_file "$have_tech")
+              scan "$artifact" "" "${p1[@]}" --json_output true --json_output_file results.json
+              # Fetch APPROVED platform mitigations for these findings by app profile.
+              sbx=(); [ -n "${BASELINE_SANDBOX}" ] && sbx=(--sandbox-guid "${BASELINE_SANDBOX}")
+              python3 "$MGR" mitigate --script vcpipemit.py --results results.json \
+                --app-name "$app" --output mitigations.json "${sbx[@]}"
+              # Combined baseline = tech debt + approved mitigations.
+              python3 "$MGR" merge --baseline "${have_tech:-/nonexistent}" \
+                --mitigations mitigations.json --output combined.json
+              p2=(); [ -f combined.json ] && p2=(--baseline_file combined.json)
+              # Pass 2: gate on net-new findings that are NOT mitigated on the platform.
+              scan "$artifact" "${BASELINE_FAIL_SEVERITY}" "${p2[@]}"
+              rc=$?
+            else
+              base=(); [ -n "$have_tech" ] && base=(--baseline_file "$have_tech")
+              scan "$artifact" "${BASELINE_FAIL_SEVERITY}" "${base[@]}"
+              rc=$?
+            fi
             set -e
             echo "::endgroup::"
 

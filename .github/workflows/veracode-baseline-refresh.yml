@@ -118,22 +118,19 @@ jobs:
           [ -s artifacts_list.txt ] || { echo "No artifacts found"; exit 1; }
           nl artifacts_list.txt
 
-      - name: Download Pipeline Scanner + mitigation overlay
+      - name: Download Pipeline Scanner
         shell: bash
         run: |
           set -e
           wget -q https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -n pipeline-scan-LATEST.zip
-          pip3 install -q -r https://raw.githubusercontent.com/tjarrettveracode/veracode-pipeline-mitigation/master/requirements.txt
-          wget -q https://raw.githubusercontent.com/tjarrettveracode/veracode-pipeline-mitigation/master/vcpipemit.py -O vcpipemit.py
 
       - name: Create + record baselines
         shell: bash
-        env:
-          VERACODE_API_KEY_ID: ${{ secrets.VERACODE_API_ID }}
-          VERACODE_API_KEY_SECRET: ${{ secrets.VERACODE_API_KEY }}
         run: |
           set -e
+          # Refresh stores only the tech-debt baseline. Platform mitigations are
+          # applied live at delta time (mode: mitigated) so they are always fresh.
           keep_args=()
           while IFS= read -r artifact; do
             [ -z "$artifact" ] && continue
@@ -141,7 +138,7 @@ jobs:
             keep_args+=( "$name" )
             echo "::group::baseline $name"
 
-            rm -f results.json mitigated.json
+            rm -f results.json
             set +e
             java -jar pipeline-scan.jar \
               --veracode_api_id  "${{ secrets.VERACODE_API_ID }}" \
@@ -152,18 +149,9 @@ jobs:
               echo "::warning::no results.json for $name; skipping"; echo "::endgroup::"; continue
             fi
 
-            # mitigation overlay only when mode is mitigated
-            mit_arg=()
-            if [ "${BASELINE_MODE}" = "mitigated" ]; then
-              python3 "$MGR" mitigate \
-                --script vcpipemit.py --results results.json \
-                --applicationname "$REPO" --output mitigated.json || true
-              [ -f mitigated.json ] && mit_arg=( --mitigated mitigated.json )
-            fi
-
             python3 "$MGR" record --store "$STORE_DIR" \
               --org "$ORG" --repo "$REPO" --branch "$BRANCH" --artifact "$name" \
-              --results results.json "${mit_arg[@]}"
+              --results results.json
             echo "::endgroup::"
           done < artifacts_list.txt
 

@@ -1,0 +1,34 @@
+name: Veracode Pipeline Scan
+
+# Option 1 of 3: a plain Pipeline Scan with no baseline. Fails on any finding at
+# or above fail_on_severity. Use this when you want the full scan result, not a
+# delta. Selectable explicitly here, or via veracode.yml baseline.mode: none.
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        required: true
+        type: string
+      target_ref:
+        required: true
+        type: string
+    secrets:
+      VERACODE_API_ID:
+        required: true
+      VERACODE_API_KEY:
+        required: true
+      TARGET_CHECKOUT_TOKEN:
+        required: true
+
+jobs:
+  scan:
+    uses: ./.github/workflows/veracode-baseline-delta.yml
+    with:
+      target_repo: ${{ inputs.target_repo }}
+      target_ref: ${{ inputs.target_ref }}
+      mode: none
+    secrets:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+      TARGET_CHECKOUT_TOKEN: ${{ secrets.TARGET_CHECKOUT_TOKEN }}

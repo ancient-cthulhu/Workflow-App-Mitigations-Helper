@@ -1,0 +1,37 @@
+name: Veracode Delta Scan (mitigation aware)
+
+# Option 3 of 3: a delta scan that gates on net-new findings AND excludes findings
+# already APPROVED-mitigated on the Veracode platform. It fetches the application's
+# approved mitigations live (app profile resolved from veracode.yml
+# app_profile_name, default org/repo) and merges them with the tech-debt baseline,
+# so a flaw a reviewer has formally accepted never breaks the build. Selectable
+# explicitly here, or via veracode.yml baseline.mode: mitigated.
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        required: true
+        type: string
+      target_ref:
+        required: true
+        type: string
+    secrets:
+      VERACODE_API_ID:
+        required: true
+      VERACODE_API_KEY:
+        required: true
+      TARGET_CHECKOUT_TOKEN:
+        required: true
+
+jobs:
+  scan:
+    uses: ./.github/workflows/veracode-baseline-delta.yml
+    with:
+      target_repo: ${{ inputs.target_repo }}
+      target_ref: ${{ inputs.target_ref }}
+      mode: mitigated
+    secrets:
+      VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+      VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+      TARGET_CHECKOUT_TOKEN: ${{ secrets.TARGET_CHECKOUT_TOKEN }}

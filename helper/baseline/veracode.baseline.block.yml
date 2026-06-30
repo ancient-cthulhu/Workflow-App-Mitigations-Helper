@@ -1,4 +1,4 @@
-baseline:
+  baseline:
     # Master switch. false keeps plain Pipeline Scans unchanged (staged rollout).
     enabled: true
     # none | full | mitigated. mitigated also ignores findings already
@@ -11,6 +11,12 @@ baseline:
     fail_on_severity: "Very High, High"
     # true fails the delta when a baseline is missing instead of scanning without one.
     strict: false
+    # Application profile name used to fetch APPROVED platform mitigations (mode: mitigated).
+    # {org} and {repo} are filled in per scanned repo. The Workflow Integration uses
+    # github.repository (org/repo) as the appname, so this default matches by construction.
+    app_profile_name: "{org}/{repo}"
+    # Optional sandbox GUID to pull mitigations from instead of the policy scan.
+    sandbox: ""
     # Drop stored artifact baselines that no longer appear in a refresh.
     prune_orphans: true
     refresh:

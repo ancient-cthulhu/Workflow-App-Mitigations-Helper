@@ -1,4 +1,4 @@
-# Veracode Workflow App Baseline + Mitigation Management
+# Veracode Baseline + Mitigation Management
 
 Adds robust, auditable Pipeline Scan baseline management to the Veracode GitHub Workflow Integration. Baselines (and mitigation-aware baselines) live inside the `veracode` integration repo itself, are configured entirely from `veracode.yml`, and drive delta scans that fail only on net-new findings. A bulk rollout script deploys the whole feature across many organizations' `veracode` repos at scale, with rate limiting, checkpoint/resume, and audit trails.
 
@@ -10,9 +10,27 @@ This feature is meant to be added to the repo you import from `github.com/veraco
 
 The feature has two workflows and one store, all configured by a single `baseline:` block in `veracode.yml`:
 
-1. **Refresh** (`veracode-baseline-refresh.yml`) runs on a schedule, on default-branch merges, or on demand. It packages a target repo, runs a full Pipeline Scan per build artifact, optionally applies the mitigation overlay, and records each baseline (with metadata) into the store inside the `veracode` repo.
-1. **Delta** (`veracode-baseline-delta.yml`) runs on push and pull request. It packages the target repo, pulls each artifact's stored baseline, and runs the Pipeline Scan with `--baseline_file`, breaking the build only on new findings at or above the configured severity.
-1. **Store** lives at `baselines/<org>/<repo>/<branch>/<artifact>/` in the `veracode` repo. Each artifact carries `baseline.json`, an optional `baseline-mitigated-findings.json`, and a `meta.json` (scan id, engine version, finding counts, sha256, commit). A per-repo `manifest.json` summarizes branches and artifacts.
+1. **Refresh** (`veracode-baseline-refresh.yml`) runs on a schedule, on default-branch merges, or on demand. It packages a target repo, runs a full Pipeline Scan per build artifact, and records each tech-debt baseline (with metadata) into the store inside the `veracode` repo.
+1. **Delta** (`veracode-baseline-delta.yml`) runs on push and pull request. It packages the target repo and gates on findings that are new relative to the stored baseline. In `mitigated` mode it also fetches the application's APPROVED platform mitigations live and excludes them, so a flaw a reviewer has already accepted on the platform never breaks the build.
+1. **Store** lives at `baselines/<org>/<repo>/<branch>/<artifact>/` in the `veracode` repo. Each artifact carries `baseline.json` and a `meta.json` (scan id, engine version, finding counts, sha256, commit). A per-repo `manifest.json` summarizes branches and artifacts.
+
+Platform mitigations are applied live at delta time rather than baked into the store, so they are always current. The application profile is identified by the same deterministic name the integration uses for upload-and-scan, `github.repository` (org/repo), resolved to a GUID automatically.
+
+### The three scan options
+
+There are exactly three scan behaviours, selectable two ways: call the named
+option workflow directly, or set `veracode_static_scan.baseline.mode` and call
+the shared engine. They all run on the same engine (`veracode-baseline-delta.yml`).
+
+|Option workflow                        |mode       |What breaks the build                                              |
+|---------------------------------------|-----------|------------------------------------------------------------------|
+|`veracode-pipeline-scan.yml`           |`none`     |Any finding at/above `fail_on_severity` (plain Pipeline Scan).     |
+|`veracode-delta-scan.yml`              |`full`     |Net-new findings vs the stored tech-debt baseline.                |
+|`veracode-delta-mitigated-scan.yml`    |`mitigated`|Net-new findings that are NOT approved-mitigated on the platform. |
+
+Calling an option workflow forces that behaviour and bypasses the `enabled`
+flag. Calling the engine with no `mode` input reads both `mode` and `enabled`
+from veracode.yml, so a single fleet config selects the option per repo.
 
 Because the store lives in the `veracode` repo, the refresh workflow commits with the repo's own `GITHUB_TOKEN`. There is no separate baseline repository and no long-lived personal access token.
 
@@ -28,7 +46,6 @@ veracode/
 ├── baselines/                                    # the store (created on first refresh)
 │   └── <org>/<repo>/<branch>/<artifact>/
 │       ├── baseline.json
-│       ├── baseline-mitigated-findings.json
 │       └── meta.json
 │   └── <org>/<repo>/manifest.json
 ├── helper/baseline/
@@ -37,10 +54,13 @@ veracode/
 │   ├── requirements.txt
 │   └── veracode.baseline.block.yml               # the block the rollout script injects
 ├── tools/
-│   └── rollout.py              # bulk rollout across orgs
+│   └── veracode_baseline_rollout.py              # bulk rollout across orgs
 └── .github/workflows/
-    ├── veracode-baseline-refresh.yml
-    └── veracode-baseline-delta.yml
+    ├── veracode-baseline-refresh.yml        # creates/updates the tech-debt baseline
+    ├── veracode-baseline-delta.yml          # shared scan engine (mode: none|full|mitigated)
+    ├── veracode-pipeline-scan.yml           # option: plain Pipeline Scan
+    ├── veracode-delta-scan.yml              # option: new-findings delta
+    └── veracode-delta-mitigated-scan.yml    # option: mitigation-aware delta
 ```
 
 -----
@@ -58,6 +78,8 @@ veracode_static_scan:
     store_branch: main                 # branch of the veracode repo holding the store
     fail_on_severity: "Very High, High"
     strict: false                      # true fails the delta when a baseline is missing
+    app_profile_name: "{org}/{repo}"   # appname used to fetch platform mitigations
+    sandbox: ""                        # optional sandbox GUID to pull mitigations from
     prune_orphans: true                # drop baselines for artifacts that no longer exist
     refresh:
       on_schedule: true
@@ -71,11 +93,17 @@ veracode_static_scan:
 |`store_branch`                 |branch name                     |Branch of the `veracode` repo holding the store.              |
 |`fail_on_severity`             |severity list                   |Severities that break the delta when introduced as new.       |
 |`strict`                       |`true` / `false`                |Fail (vs scan without a baseline) when one is missing.        |
+|`app_profile_name`             |name template                   |Application profile name for the mitigation lookup. `{org}` and `{repo}` are substituted per scanned repo.|
+|`sandbox`                      |sandbox GUID                    |Optional. Pull mitigations from a sandbox instead of the policy scan.|
 |`prune_orphans`                |`true` / `false`                |Remove stored baselines for artifacts no longer produced.     |
 |`refresh.on_schedule`          |`true` / `false`                |Rebuild baselines on the scheduled run.                       |
 |`refresh.on_default_branch_push`|`true` / `false`               |Rebuild a repo's baseline when it merges to its default branch.|
 
-`mode: mitigated` ignores findings already mitigated or accepted on the Veracode platform and falls back to the full baseline when no mitigated file exists.
+The three modes:
+
+- `none`: no baseline. The delta fails on any finding at or above `fail_on_severity`.
+- `full`: gate on net-new findings only (compared against the stored tech-debt baseline). Platform mitigations are not consulted.
+- `mitigated`: gate on net-new findings that are also NOT approved-mitigated on the platform. This is a live two-pass delta: scan to get the findings, fetch the application's approved mitigations via `vcpipemit` (app profile resolved from `app_profile_name`), merge them with the tech-debt baseline, then re-scan against the combined baseline. Only APPROVED mitigations are honored; proposed mitigations are ignored. If the app profile does not exist yet or has no mitigations, the delta degrades to `full` behavior.
 
 -----
 
@@ -120,9 +148,10 @@ Tokens used by the workflows:
 The store engine. Standard library only, callable directly for local inspection or scripting.
 
 ```
-baseline_manager.py record  --org O --repo R --branch B --artifact A --results results.json [--mitigated m.json]
-baseline_manager.py pull    --org O --repo R --branch B --artifact A --mode mitigated --dest out.json [--strict]
-baseline_manager.py mitigate --script vcpipemit.py --results results.json --applicationname R --output m.json
+baseline_manager.py record  --org O --repo R --branch B --artifact A --results results.json
+baseline_manager.py pull    --org O --repo R --branch B --artifact A --mode full --dest out.json [--strict]
+baseline_manager.py mitigate --script vcpipemit.py --results results.json --app-name "O/R" --output mit.json [--sandbox-guid GUID]
+baseline_manager.py merge   --baseline tech_debt.json --mitigations mit.json --output combined.json
 baseline_manager.py prune   --org O --repo R --branch B --keep a.jar b.war
 baseline_manager.py status  --org O --repo R --branch B
 ```
@@ -131,7 +160,8 @@ baseline_manager.py status  --org O --repo R --branch B
 |----------|------------------------------------------------------------------------------|
 |`record`  |Validate a results file and store it with metadata + manifest update.         |
 |`pull`    |Copy a stored baseline into the workspace for a delta scan (sentinel if absent).|
-|`mitigate`|Run the mitigation overlay in an isolated dir and emit one validated file.     |
+|`mitigate`|Resolve the app profile name to a GUID and fetch APPROVED platform mitigations as a baseline file (via `vcpipemit`).|
+|`merge`   |Union a tech-debt baseline with a mitigations baseline (dedup by `flaw_match`).|
 |`prune`   |Remove stored artifact baselines that no longer exist.                         |
 |`status`  |Print the manifest for one repo/branch.                                        |
 
@@ -141,10 +171,10 @@ Validation rejects any results file that is not valid JSON, lacks a `findings` a
 
 ## Bulk Rollout
 
-`tools/rollout.py` deploys this feature into the `veracode` repo of every organization that already has the integration onboarded. For each org it:
+`tools/veracode_baseline_rollout.py` deploys this feature into the `veracode` repo of every organization that already has the integration onboarded. For each org it:
 
 1. Confirms the `veracode` repo exists and is not empty (skips otherwise; onboard the integration first).
-1. Deploys `helper/baseline/*` and the two baseline workflows via the GitHub Contents API (create, update on change, or skip when identical).
+1. Deploys `helper/baseline/*` and the baseline workflows (refresh, the shared delta engine, and the three scan options) via the GitHub Contents API (create, update on change, or skip when identical).
 1. Reconciles the `baseline:` block under `veracode_static_scan` in `veracode.yml`. It inserts the block as the first child when missing, and when a block already exists it replaces exactly that block with the canonical one if the two differ. Everything outside the baseline block (other keys, sibling comments, blank lines, and the SCA and IaC blocks) is preserved unchanged, and re-runs converge to `already_current`. Use `--yml-insert-only` to add a missing block but never modify an existing one (preserves per-repo hand-tuned settings).
 
 It calls no Veracode API. The rollout is pure GitHub content work. It mirrors the integration rollout helper's conventions, dry-run by default, enterprise/orgs-file discovery, checkpoint/resume, parallel workers, a global GitHub rate limiter, and CSV + JSON output.
@@ -162,10 +192,10 @@ It calls no Veracode API. The rollout is pure GitHub content work. It mirrors th
 export GITHUB_TOKEN="..."
 
 # Phase 1: audit what would change across the fleet
-python tools/rollout.py --enterprise YOUR-ENTERPRISE
+python tools/veracode_baseline_rollout.py --enterprise YOUR-ENTERPRISE
 
 # Phase 2: deploy, 5 workers
-python tools/rollout.py --apply --enterprise YOUR-ENTERPRISE --workers 5
+python tools/veracode_baseline_rollout.py --apply --enterprise YOUR-ENTERPRISE --workers 5
 ```
 
 Run it from the `veracode` repo root so `--assets-dir` defaults to the repo and reads the canonical asset files.
@@ -173,7 +203,7 @@ Run it from the `veracode` repo root so `--assets-dir` defaults to the repo and 
 ### Requirements
 
 ```bash
-pip install requests pyyaml
+pip install requests pyyaml veracode-api-signing
 git --version        # not required by the rollout itself; needed by the workflows at scan time
 ```
 
@@ -232,7 +262,10 @@ Python 3.10+ (the tooling uses modern type-hint syntax).
     "helper/baseline/config.py": "created",
     "helper/baseline/requirements.txt": "created",
     ".github/workflows/veracode-baseline-refresh.yml": "created",
-    ".github/workflows/veracode-baseline-delta.yml": "created"
+    ".github/workflows/veracode-baseline-delta.yml": "created",
+    ".github/workflows/veracode-pipeline-scan.yml": "created",
+    ".github/workflows/veracode-delta-scan.yml": "created",
+    ".github/workflows/veracode-delta-mitigated-scan.yml": "created"
   },
   "veracode_yml": "injected"
 }
@@ -246,7 +279,7 @@ Python 3.10+ (the tooling uses modern type-hint syntax).
 
 ### Parallel Execution
 
-By default the rollout processes one org at a time. `--workers N` runs orgs concurrently with a thread pool. A full apply averages about six writes per org (five files plus one yml), so the binding constraint is GitHub's content-creation secondary limit, not raw throughput.
+By default the rollout processes one org at a time. `--workers N` runs orgs concurrently with a thread pool. A full apply averages about nine writes per org (eight files plus one yml), so the binding constraint is GitHub's content-creation secondary limit, not raw throughput.
 
 |Window                            |GitHub limit|Tool's safe target  |
 |----------------------------------|------------|--------------------|

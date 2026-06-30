@@ -25,6 +25,8 @@ DEFAULTS = {
     "BASELINE_STORE_BRANCH": "main",       # branch in the veracode repo store
     "BASELINE_FAIL_SEVERITY": "Very High, High",
     "BASELINE_STRICT": "false",            # fail delta if a baseline is missing
+    "BASELINE_APP_PROFILE": "{org}/{repo}",  # deterministic appname for mitigation lookup
+    "BASELINE_SANDBOX": "",                # optional sandbox name for mitigation lookup
     "BASELINE_REFRESH_ON_SCHEDULE": "true",
     "BASELINE_REFRESH_ON_DEFAULT_PUSH": "true",
     "BASELINE_PRUNE_ORPHANS": "true",
@@ -37,6 +39,8 @@ KEYMAP = {
     "store_branch": "BASELINE_STORE_BRANCH",
     "fail_on_severity": "BASELINE_FAIL_SEVERITY",
     "strict": "BASELINE_STRICT",
+    "app_profile_name": "BASELINE_APP_PROFILE",
+    "sandbox": "BASELINE_SANDBOX",
     "prune_orphans": "BASELINE_PRUNE_ORPHANS",
 }
 

@@ -21,7 +21,8 @@ CLI:
   path      print the store dir for one artifact
   record    validate + store baseline(.json) [+ mitigated] + meta + manifest
   pull      copy a stored baseline into the workspace for a delta scan
-  mitigate  run the mitigation overlay robustly and emit the mitigated file
+  mitigate  fetch approved platform mitigations (by app profile) as a baseline
+  merge     union a tech-debt baseline with a mitigations baseline
   prune     drop artifact dirs that no longer exist (artifact renames/removals)
   status    print the manifest for one repo/branch
 """
@@ -242,11 +243,43 @@ def cmd_pull(args) -> int:
     return EXIT_OK
 
 
-def cmd_mitigate(args) -> int:
-    """Run the mitigation overlay and emit exactly one validated output file.
+def _resolve_app_guid(app_name: str, api_id: str, api_key: str) -> str | None:
+    """Resolve a Veracode application profile name (the deterministic org/repo the
+    Workflow Integration uses as appname) to its GUID, which is what vcpipemit
+    requires. Returns the guid, or None if no exact-name match is found.
+    """
+    import requests  # lazy: only needed for the live mitigation overlay
+    from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 
-    Avoids the fragile `ls -t baseline-*.json | head` pattern by running the
-    helper in an isolated temp dir and taking the single file it produces.
+    auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
+    url = "https://api.veracode.com/appsec/v1/applications"
+    page = 0
+    while True:
+        r = requests.get(url, params={"name": app_name, "size": 100, "page": page}, auth=auth, timeout=45)
+        if r.status_code != 200:
+            print(f"::warning::application lookup for {app_name!r} returned {r.status_code}", file=sys.stderr)
+            return None
+        body = r.json()
+        for app in body.get("_embedded", {}).get("applications", []):
+            if (app.get("profile") or {}).get("name") == app_name:
+                return app.get("guid")
+        meta = body.get("page", {})
+        if page >= meta.get("total_pages", 1) - 1:
+            return None
+        page += 1
+
+
+def cmd_mitigate(args) -> int:
+    """Fetch APPROVED platform mitigations for the app profile and emit them as a
+    Pipeline Scan baseline file.
+
+    The app profile name is the deterministic org/repo the Workflow Integration
+    uses as appname; this resolves it to a GUID and runs vcpipemit (-a <guid>),
+    which writes baseline-<guid>.json. Output is isolated in a temp dir so the
+    produced file is located deterministically (no `ls -t` guessing).
+
+    Credentials are read from VERACODE_API_KEY_ID / VERACODE_API_KEY_SECRET (the
+    same variables vcpipemit itself uses) or from --api-id / --api-key.
     """
     script = Path(args.script)
     results = Path(args.results)
@@ -254,22 +287,34 @@ def cmd_mitigate(args) -> int:
         print(f"::error::mitigation script not found: {script}", file=sys.stderr)
         return EXIT_ERROR
 
+    api_id = args.api_id or os.environ.get("VERACODE_API_KEY_ID") or os.environ.get("VERACODE_API_ID")
+    api_key = args.api_key or os.environ.get("VERACODE_API_KEY_SECRET") or os.environ.get("VERACODE_API_KEY")
+    if not api_id or not api_key:
+        print("::warning::no Veracode credentials for mitigation overlay; "
+              "delta will run without platform mitigations", file=sys.stderr)
+        return EXIT_MISSING
+
+    guid = args.app_guid or _resolve_app_guid(args.app_name, api_id, api_key)
+    if not guid:
+        print(f"::warning::no application profile named {args.app_name!r} on the platform; "
+              "delta will run without platform mitigations", file=sys.stderr)
+        return EXIT_MISSING
+
+    cmd = [sys.executable, str(script.resolve()), "-a", guid, "-rf", BASELINE_NAME]
+    if args.sandbox_guid:
+        cmd += ["-s", args.sandbox_guid]
+
+    env = {**os.environ, "VERACODE_API_KEY_ID": api_id, "VERACODE_API_KEY_SECRET": api_key}
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        local_results = tmp / BASELINE_NAME
-        shutil.copyfile(results, local_results)
+        shutil.copyfile(results, tmp / BASELINE_NAME)
         before = set(tmp.glob("*.json"))
-        proc = subprocess.run(
-            [sys.executable, str(script.resolve()),
-             "--results", local_results.name,
-             "--applicationname", args.applicationname],
-            cwd=tmp, capture_output=True, text=True,
-        )
+        proc = subprocess.run(cmd, cwd=tmp, capture_output=True, text=True, env=env)
         produced = [p for p in tmp.glob("baseline-*.json") if p not in before]
         if proc.returncode != 0 or not produced:
             sys.stderr.write(proc.stdout + proc.stderr)
             print("::warning::mitigation overlay produced no file; "
-                  "delta will fall back to the full baseline", file=sys.stderr)
+                  "delta will run without platform mitigations", file=sys.stderr)
             return EXIT_MISSING
         chosen = max(produced, key=lambda p: p.stat().st_mtime)
         try:
@@ -280,7 +325,65 @@ def cmd_mitigate(args) -> int:
         dest = Path(args.output)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(chosen, dest)
-        print(f"mitigated findings: {count} -> {dest}")
+        print(f"approved platform mitigations for {args.app_name}: {count} -> {dest}")
+    return EXIT_OK
+
+
+def _finding_key(finding: dict) -> str:
+    """Stable identity for a pipeline finding, matching how Pipeline Scan keys
+    baselines: the flaw_match object, falling back to type + location. issue_id
+    is per-scan and deliberately excluded.
+    """
+    fm = finding.get("flaw_match")
+    if isinstance(fm, dict) and fm:
+        return "fm:" + json.dumps(fm, sort_keys=True)
+    src = ((finding.get("files") or {}).get("source_file") or {})
+    return "loc:" + json.dumps(
+        [finding.get("cwe_id"), finding.get("issue_type_id"), src.get("file"), src.get("line")],
+        sort_keys=True,
+    )
+
+
+def cmd_merge(args) -> int:
+    """Union a tech-debt baseline with an approved-mitigations baseline into one
+    Pipeline Scan baseline, so a single --baseline_file suppresses both existing
+    findings (net-new gating) and platform-mitigated findings. Either input may
+    be absent.
+    """
+    base = Path(args.baseline) if args.baseline else None
+    mit = Path(args.mitigations) if args.mitigations else None
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    have_base = bool(base and base.is_file())
+    have_mit = bool(mit and mit.is_file())
+
+    if not have_base and not have_mit:
+        print("::warning::no baseline and no mitigations to merge", file=sys.stderr)
+        return EXIT_MISSING
+    if have_base and not have_mit:
+        shutil.copyfile(base, out)
+        print(f"merged: baseline only -> {out}")
+        return EXIT_OK
+    if have_mit and not have_base:
+        shutil.copyfile(mit, out)
+        print(f"merged: mitigations only -> {out}")
+        return EXIT_OK
+
+    base_doc = _load_json(base)
+    mit_doc = _load_json(mit)
+    findings = list(base_doc.get("findings") or [])
+    seen = {_finding_key(f) for f in findings}
+    added = 0
+    for f in mit_doc.get("findings") or []:
+        k = _finding_key(f)
+        if k not in seen:
+            seen.add(k)
+            findings.append(f)
+            added += 1
+    base_doc["findings"] = findings
+    _dump_json(out, base_doc)
+    print(f"merged: {len(findings) - added} baseline + {added} new mitigated = {len(findings)} -> {out}")
     return EXIT_OK
 
 
@@ -357,12 +460,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strict", action="store_true", help="fail if no baseline exists")
     p.set_defaults(func=cmd_pull)
 
-    p = sub.add_parser("mitigate", help="run the mitigation overlay robustly")
+    p = sub.add_parser("mitigate", help="fetch approved platform mitigations as a baseline file")
     p.add_argument("--script", required=True, help="path to vcpipemit.py")
-    p.add_argument("--results", required=True)
-    p.add_argument("--applicationname", required=True)
+    p.add_argument("--results", required=True, help="pipeline-scan results.json to match mitigations against")
+    p.add_argument("--app-name", required=True, help="application profile name (the org/repo appname)")
+    p.add_argument("--app-guid", help="application GUID (skips name resolution)")
+    p.add_argument("--sandbox-guid", help="sandbox GUID to pull mitigations from (optional)")
+    p.add_argument("--api-id", help="Veracode API id (else VERACODE_API_KEY_ID / VERACODE_API_ID env)")
+    p.add_argument("--api-key", help="Veracode API key (else VERACODE_API_KEY_SECRET / VERACODE_API_KEY env)")
     p.add_argument("--output", default=MITIGATED_NAME)
     p.set_defaults(func=cmd_mitigate)
+
+    p = sub.add_parser("merge", help="union a tech-debt baseline with a mitigations baseline")
+    p.add_argument("--baseline", help="tech-debt baseline file (optional)")
+    p.add_argument("--mitigations", help="approved-mitigations baseline file (optional)")
+    p.add_argument("--output", required=True, help="combined baseline output path")
+    p.set_defaults(func=cmd_merge)
 
     p = sub.add_parser("prune", help="remove orphan artifact dirs")
     _common_ids(p, artifact=False)

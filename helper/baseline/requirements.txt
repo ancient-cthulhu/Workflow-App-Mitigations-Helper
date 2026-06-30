@@ -1,3 +1,7 @@
-# Baseline helper dependencies (in addition to the mitigation overlay's own
-# requirements, which the refresh workflow installs from the upstream repo).
+# Baseline helper dependencies.
+# pyyaml: config.py reads veracode.yml
+# requests + veracode-api-signing: mitigate resolves the app profile name to a
+#   GUID and authenticates the platform-mitigation lookup (vcpipemit needs both).
 pyyaml>=6.0
+requests>=2.31
+veracode-api-signing>=22.0

@@ -1,4 +1,4 @@
-# Veracode Baseline + Mitigation Management
+# Veracode Workflow App Baseline + Mitigation Management
 
 Adds robust, auditable Pipeline Scan baseline management to the Veracode GitHub Workflow Integration. Baselines (and mitigation-aware baselines) live inside the `veracode` integration repo itself, are configured entirely from `veracode.yml`, and drive delta scans that fail only on net-new findings. A bulk rollout script deploys the whole feature across many organizations' `veracode` repos at scale, with rate limiting, checkpoint/resume, and audit trails.
 

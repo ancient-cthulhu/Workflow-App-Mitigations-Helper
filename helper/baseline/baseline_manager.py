@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Veracode baseline + mitigation store manager.
+
+Lives inside the Veracode GitHub Workflow Integration repo (the repo you import
+into your org and name 'veracode'). It owns the on-repo baseline store used for
+Pipeline Scan delta scans, including mitigation-aware baselines.
+
+Design goals (vs a pile of inline bash):
+  * Deterministic, browsable layout keyed by the org/repo convention the
+    workflow integration already uses: baselines/<org>/<repo>/<branch>/<artifact>/
+  * Every stored baseline carries meta.json (scan_id, engine_version, finding
+    counts, sha256, commit, timestamp) so the store is auditable.
+  * Validation on write so a broken results.json never poisons a baseline.
+  * Deterministic mitigation-overlay handling (no `ls -t` guessing).
+  * Per-repo manifest.json instead of one global index, so concurrent refreshes
+    of different repos never contend on the same file.
+  * Standard library only. The only external dependency is the mitigation
+    helper script (vcpipemit.py), invoked as a subprocess.
+
+CLI:
+  path      print the store dir for one artifact
+  record    validate + store baseline(.json) [+ mitigated] + meta + manifest
+  pull      copy a stored baseline into the workspace for a delta scan
+  mitigate  run the mitigation overlay robustly and emit the mitigated file
+  prune     drop artifact dirs that no longer exist (artifact renames/removals)
+  status    print the manifest for one repo/branch
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+STORE_ROOT = "baselines"
+BASELINE_NAME = "baseline.json"
+MITIGATED_NAME = "baseline-mitigated-findings.json"
+META_NAME = "meta.json"
+MANIFEST_NAME = "manifest.json"
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_MISSING = 3  # sentinel: no baseline found (non-strict callers continue)
+
+_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe(value: str) -> str:
+    """Filesystem-safe component. Reversible enough to stay human readable."""
+    return _SAFE.sub("_", value.strip())
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_json(path: Path) -> dict:
+    with path.open(encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _dump_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def repo_dir(store: Path, org: str, repo: str) -> Path:
+    return store / _safe(org) / _safe(repo)
+
+
+def artifact_dir(store: Path, org: str, repo: str, branch: str, artifact: str) -> Path:
+    return repo_dir(store, org, repo) / _safe(branch) / _safe(artifact)
+
+
+# --------------------------------------------------------------------------- #
+# validation
+# --------------------------------------------------------------------------- #
+def validate_results(path: Path, *, require_success: bool = False) -> int:
+    """Validate a Pipeline Scan results / mitigated-findings file.
+
+    Returns the finding count. Raises ValueError on a structurally bad file so
+    callers can fail loudly instead of committing garbage to the store.
+    """
+    if not path.is_file():
+        raise ValueError(f"file not found: {path}")
+    try:
+        data = _load_json(path)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} top-level is not an object")
+    findings = data.get("findings")
+    if not isinstance(findings, list):
+        raise ValueError(f"{path} has no 'findings' array")
+    if require_success and data.get("scan_status") not in (None, "SUCCESS"):
+        raise ValueError(f"{path} scan_status is {data.get('scan_status')!r}")
+    return len(findings)
+
+
+def _scan_meta(results: Path) -> dict:
+    """Pull non-identifying scan metadata out of a results.json if present."""
+    try:
+        data = _load_json(results)
+    except Exception:
+        return {}
+    return {
+        k: data.get(k)
+        for k in ("scan_id", "scan_status", "engine_version", "pipeline_scan", "dev_stage")
+        if data.get(k) is not None
+    }
+
+
+# --------------------------------------------------------------------------- #
+# manifest (per repo, not global, to avoid cross-repo commit contention)
+# --------------------------------------------------------------------------- #
+def _manifest_path(store: Path, org: str, repo: str) -> Path:
+    return repo_dir(store, org, repo) / MANIFEST_NAME
+
+
+def _update_manifest(store: Path, org: str, repo: str, branch: str, artifact: str, entry: dict) -> None:
+    mpath = _manifest_path(store, org, repo)
+    manifest = _load_json(mpath) if mpath.is_file() else {"org": org, "repo": repo, "branches": {}}
+    branches = manifest.setdefault("branches", {})
+    arts = branches.setdefault(branch, {})
+    arts[artifact] = entry
+    manifest["updated_at"] = _now()
+    _dump_json(mpath, manifest)
+
+
+def _drop_from_manifest(store: Path, org: str, repo: str, branch: str, artifacts) -> None:
+    mpath = _manifest_path(store, org, repo)
+    if not mpath.is_file():
+        return
+    manifest = _load_json(mpath)
+    arts = manifest.get("branches", {}).get(branch, {})
+    for a in artifacts:
+        arts.pop(a, None)
+    manifest["updated_at"] = _now()
+    _dump_json(mpath, manifest)
+
+
+# --------------------------------------------------------------------------- #
+# commands
+# --------------------------------------------------------------------------- #
+def cmd_path(args) -> int:
+    print(artifact_dir(Path(args.store), args.org, args.repo, args.branch, args.artifact))
+    return EXIT_OK
+
+
+def cmd_record(args) -> int:
+    store = Path(args.store)
+    results = Path(args.results)
+    try:
+        total = validate_results(results, require_success=True)
+    except ValueError as exc:
+        print(f"::error::baseline rejected: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    out = artifact_dir(store, args.org, args.repo, args.branch, args.artifact)
+    out.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(results, out / BASELINE_NAME)
+
+    meta = {
+        "org": args.org,
+        "repo": args.repo,
+        "branch": args.branch,
+        "artifact": args.artifact,
+        "total_findings": total,
+        "baseline_sha256": _sha256(out / BASELINE_NAME),
+        "source_commit": args.commit,
+        "recorded_at": _now(),
+        "recorded_by": args.actor,
+        "scan": _scan_meta(results),
+    }
+
+    mitigated_count = None
+    if args.mitigated and Path(args.mitigated).is_file():
+        try:
+            mitigated_count = validate_results(Path(args.mitigated))
+        except ValueError as exc:
+            print(f"::warning::mitigated file ignored: {exc}", file=sys.stderr)
+        else:
+            shutil.copyfile(args.mitigated, out / MITIGATED_NAME)
+            meta["mitigated_findings"] = mitigated_count
+            meta["mitigated_sha256"] = _sha256(out / MITIGATED_NAME)
+
+    _dump_json(out / META_NAME, meta)
+    _update_manifest(
+        store, args.org, args.repo, args.branch, _safe(args.artifact),
+        {
+            "total_findings": total,
+            "mitigated_findings": mitigated_count,
+            "updated_at": meta["recorded_at"],
+            "commit": args.commit,
+            "scan_id": meta["scan"].get("scan_id"),
+        },
+    )
+    extra = "" if mitigated_count is None else f", mitigated {mitigated_count}"
+    print(f"recorded {args.artifact}: {total} findings{extra} -> {out}")
+    return EXIT_OK
+
+
+def cmd_pull(args) -> int:
+    store = Path(args.store)
+    src = artifact_dir(store, args.org, args.repo, args.branch, args.artifact)
+    name = MITIGATED_NAME if args.mode == "mitigated" else BASELINE_NAME
+    candidate = src / name
+
+    # mitigated mode falls back to the full baseline if no mitigated file exists
+    if args.mode == "mitigated" and not candidate.is_file():
+        candidate = src / BASELINE_NAME
+
+    if not candidate.is_file():
+        msg = f"no baseline for {args.org}/{args.repo}@{args.branch} :: {args.artifact}"
+        if args.strict:
+            print(f"::error::{msg}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"::warning::{msg} (delta will scan without a baseline)", file=sys.stderr)
+        return EXIT_MISSING
+
+    dest = Path(args.dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(candidate, dest)
+    print(str(dest))
+    return EXIT_OK
+
+
+def cmd_mitigate(args) -> int:
+    """Run the mitigation overlay and emit exactly one validated output file.
+
+    Avoids the fragile `ls -t baseline-*.json | head` pattern by running the
+    helper in an isolated temp dir and taking the single file it produces.
+    """
+    script = Path(args.script)
+    results = Path(args.results)
+    if not script.is_file():
+        print(f"::error::mitigation script not found: {script}", file=sys.stderr)
+        return EXIT_ERROR
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        local_results = tmp / BASELINE_NAME
+        shutil.copyfile(results, local_results)
+        before = set(tmp.glob("*.json"))
+        proc = subprocess.run(
+            [sys.executable, str(script.resolve()),
+             "--results", local_results.name,
+             "--applicationname", args.applicationname],
+            cwd=tmp, capture_output=True, text=True,
+        )
+        produced = [p for p in tmp.glob("baseline-*.json") if p not in before]
+        if proc.returncode != 0 or not produced:
+            sys.stderr.write(proc.stdout + proc.stderr)
+            print("::warning::mitigation overlay produced no file; "
+                  "delta will fall back to the full baseline", file=sys.stderr)
+            return EXIT_MISSING
+        chosen = max(produced, key=lambda p: p.stat().st_mtime)
+        try:
+            count = validate_results(chosen)
+        except ValueError as exc:
+            print(f"::warning::mitigation output invalid: {exc}", file=sys.stderr)
+            return EXIT_MISSING
+        dest = Path(args.output)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(chosen, dest)
+        print(f"mitigated findings: {count} -> {dest}")
+    return EXIT_OK
+
+
+def cmd_prune(args) -> int:
+    store = Path(args.store)
+    branch_dir = repo_dir(store, args.org, args.repo) / _safe(args.branch)
+    if not branch_dir.is_dir():
+        return EXIT_OK
+    keep = {_safe(a) for a in args.keep}
+    removed = []
+    for child in sorted(branch_dir.iterdir()):
+        if child.is_dir() and child.name not in keep:
+            shutil.rmtree(child)
+            removed.append(child.name)
+    if removed:
+        _drop_from_manifest(store, args.org, args.repo, args.branch, removed)
+        print(f"pruned orphan artifacts: {', '.join(removed)}")
+    else:
+        print("no orphan artifacts to prune")
+    return EXIT_OK
+
+
+def cmd_status(args) -> int:
+    mpath = _manifest_path(Path(args.store), args.org, args.repo)
+    if not mpath.is_file():
+        print(f"no baselines recorded for {args.org}/{args.repo}")
+        return EXIT_OK
+    manifest = _load_json(mpath)
+    arts = manifest.get("branches", {}).get(args.branch, {})
+    if not arts:
+        print(f"no baselines on branch {args.branch}")
+        return EXIT_OK
+    width = max(len(a) for a in arts)
+    print(f"{'artifact'.ljust(width)}  total  mitigated  updated_at")
+    for name, e in sorted(arts.items()):
+        print(f"{name.ljust(width)}  {str(e.get('total_findings','?')).rjust(5)}  "
+              f"{str(e.get('mitigated_findings','-')).rjust(9)}  {e.get('updated_at','')}")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# arg parsing
+# --------------------------------------------------------------------------- #
+def _common_ids(p, *, artifact=True, branch=True):
+    p.add_argument("--store", default=os.environ.get("BASELINE_STORE", STORE_ROOT))
+    p.add_argument("--org", required=True)
+    p.add_argument("--repo", required=True)
+    if branch:
+        p.add_argument("--branch", required=True)
+    if artifact:
+        p.add_argument("--artifact", required=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="baseline_manager")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("path", help="print the store dir for one artifact")
+    _common_ids(p)
+    p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("record", help="validate and store a baseline")
+    _common_ids(p)
+    p.add_argument("--results", required=True, help="pipeline-scan results.json")
+    p.add_argument("--mitigated", help="mitigation overlay output (optional)")
+    p.add_argument("--commit", default=os.environ.get("GITHUB_SHA", ""))
+    p.add_argument("--actor", default=os.environ.get("GITHUB_ACTOR", ""))
+    p.set_defaults(func=cmd_record)
+
+    p = sub.add_parser("pull", help="copy a stored baseline for a delta scan")
+    _common_ids(p)
+    p.add_argument("--mode", choices=("full", "mitigated"), default="full")
+    p.add_argument("--dest", required=True, help="where to write the baseline file")
+    p.add_argument("--strict", action="store_true", help="fail if no baseline exists")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("mitigate", help="run the mitigation overlay robustly")
+    p.add_argument("--script", required=True, help="path to vcpipemit.py")
+    p.add_argument("--results", required=True)
+    p.add_argument("--applicationname", required=True)
+    p.add_argument("--output", default=MITIGATED_NAME)
+    p.set_defaults(func=cmd_mitigate)
+
+    p = sub.add_parser("prune", help="remove orphan artifact dirs")
+    _common_ids(p, artifact=False)
+    p.add_argument("--keep", nargs="*", default=[], help="artifacts that still exist")
+    p.set_defaults(func=cmd_prune)
+
+    p = sub.add_parser("status", help="print the manifest for a repo/branch")
+    _common_ids(p, artifact=False)
+    p.set_defaults(func=cmd_status)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,18 @@
+baseline:
+    # Master switch. false keeps plain Pipeline Scans unchanged (staged rollout).
+    enabled: true
+    # none | full | mitigated. mitigated also ignores findings already
+    # mitigated/accepted on the platform, and falls back to the full baseline
+    # when no mitigated file exists.
+    mode: mitigated
+    # Branch of the veracode repo that holds the baseline store.
+    store_branch: main
+    # Severities that break the delta build when introduced as NEW findings.
+    fail_on_severity: "Very High, High"
+    # true fails the delta when a baseline is missing instead of scanning without one.
+    strict: false
+    # Drop stored artifact baselines that no longer appear in a refresh.
+    prune_orphans: true
+    refresh:
+      on_schedule: true
+      on_default_branch_push: true

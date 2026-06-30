@@ -1,0 +1,3 @@
+# Baseline helper dependencies (in addition to the mitigation overlay's own
+# requirements, which the refresh workflow installs from the upstream repo).
+pyyaml>=6.0

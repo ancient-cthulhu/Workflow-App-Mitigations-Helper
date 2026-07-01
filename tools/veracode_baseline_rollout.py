@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bulk rollout of the Veracode baseline + mitigation feature across orgs.
 
-This is a standalone admin tool (run by a CSE/admin), separate from the per-org
+This is a standalone admin tool (run by an admin), separate from the per-org
 workflows. It pushes the baseline feature into the `veracode` integration repo
 of every org that already has the GitHub Workflow Integration onboarded:
 
@@ -12,11 +12,9 @@ of every org that already has the GitHub Workflow Integration onboarded:
 It deliberately mirrors the conventions of the integration rollout helper
 (dry-run by default, --apply to change, enterprise/orgs-file discovery,
 checkpoint/resume, parallel workers, a global GitHub rate limiter, and CSV +
-JSON audit output) so it slots into the same operational muscle memory. It does
-NOT call any Veracode API: baseline rollout is pure GitHub content work.
+JSON audit output) so it slots into the same operational muscle memory. 
 
-Assets are read from --assets-dir (default: this script's own directory), which
-is expected to contain helper/baseline/* and .github/workflows/veracode-baseline-*.yml.
+It does not call any Veracode API, baseline rollout is pure GitHub content work.
 """
 from __future__ import annotations
 
